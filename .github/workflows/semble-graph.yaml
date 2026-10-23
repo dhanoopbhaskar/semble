@@ -1,0 +1,82 @@
+name: Semble Graph
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/semble-graph/**"
+      - ".github/workflows/semble-graph.yaml"
+  pull_request:
+    paths:
+      - "packages/semble-graph/**"
+      - ".github/workflows/semble-graph.yaml"
+
+jobs:
+  test:
+    name: Test sidecar (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Create virtual environment
+        run: uv venv --python ${{ matrix.python-version }} .venv
+
+      - name: Install sidecar and Semble
+        working-directory: packages/semble-graph
+        run: |
+          uv pip install --python ../../.venv/bin/python -e ".[dev,search,mcp]"
+
+      - name: Run tests
+        working-directory: packages/semble-graph
+        env:
+          PYTHONPATH: src
+        run: ../../.venv/bin/python -m pytest
+
+      - name: Lint
+        working-directory: packages/semble-graph
+        run: |
+          ../../.venv/bin/ruff check src tests benchmarks
+          ../../.venv/bin/ruff format --check src tests benchmarks
+
+      - name: Type check
+        working-directory: packages/semble-graph
+        env:
+          PYTHONPATH: src
+        run: ../../.venv/bin/mypy src
+
+  contract:
+    name: Contract (Semble ${{ matrix.semble }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        semble: ["==0.7.0", ">=0.7,<0.8"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12 .venv
+
+      - name: Install sidecar with the target Semble version
+        working-directory: packages/semble-graph
+        run: |
+          uv pip install --python ../../.venv/bin/python -e ".[dev,search]" "semble${{ matrix.semble }}"
+
+      - name: Run contract tests
+        working-directory: packages/semble-graph
+        env:
+          PYTHONPATH: src
+        run: ../../.venv/bin/python -m pytest tests -m contract
