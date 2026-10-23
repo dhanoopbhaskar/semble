@@ -23,10 +23,10 @@ NAMES_FILE = "names.json"
 def _csr(rows: list[int], columns: list[int], size: int) -> tuple[np.ndarray, np.ndarray]:
     """Build CSR indptr/indices arrays from row/column pairs."""
     order = sorted(range(len(rows)), key=lambda index: (rows[index], columns[index]))
-    indptr = np.zeros(size + 1, dtype=np.int32)
+    counts = np.zeros(size + 1, dtype=np.int32)
     for row in rows:
-        indptr[row + 1] += 1
-    indptr = np.cumsum(indptr, dtype=np.int32)
+        counts[row + 1] += 1
+    indptr = np.cumsum(counts, dtype=np.int32)
     indices = np.array([columns[index] for index in order], dtype=np.int32)
     return indptr, indices
 
