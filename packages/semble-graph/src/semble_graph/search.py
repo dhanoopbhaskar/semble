@@ -493,7 +493,7 @@ def plain_search(
 ) -> dict[str, Any]:
     """Fail-open wrapper around :func:`run_search` (kept for callers that must not raise)."""
     try:
-        return run_search(repo, query, top_k=top_k, max_snippet_lines=max_snippet_lines, content=content)
+        return run_search(str(repo), query, top_k=top_k, max_snippet_lines=max_snippet_lines, content=content)
     except Exception as exc:
         logger.exception("Plain Semble search failed")
         return {

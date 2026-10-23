@@ -149,3 +149,4 @@ exclude-newer = "1 week"
 [tool.uv.exclude-newer-package]
 model2vec = false
 semble-grammars = false
+semble = false
