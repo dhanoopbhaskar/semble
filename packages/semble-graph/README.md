@@ -7,15 +7,22 @@ impact analysis, repository overview, and graph-aware search **without changing
 Semble**. It is a separate package, process, cache, and MCP server. Semble does
 not import, detect, or depend on it.
 
+The sidecar is a **superset** of Semble's MCP and CLI surface: `search` and
+`find_related` accept the same arguments and return the same payloads, and every
+Semble CLI command is available (`search`, `find-related`, `file-types`,
+`savings`, `clear`, `install`, `uninstall`). Graph tools and commands are added on
+top.
+
 ## Why a sidecar?
 
 - **Fail open.** A missing, stale, or corrupt graph never blocks Semble search.
 - **Public API only.** Semble is imported in exactly one file,
   `src/semble_graph/compat.py`, through `semble.__all__`.
-- **Independent storage.** The sidecar owns `~/.cache/semble-graph` and never
-  writes into Semble's cache.
-- **Additive surface.** MCP tools are prefixed `graph_`; Semble's `search` and
-  `find_related` are untouched.
+- **Independent storage.** The sidecar owns `~/.cache/semble-graph`. Graph
+  extraction never writes into Semble's cache; Semble-backed commands reuse
+  Semble's own index cache.
+- **Superset surface.** MCP exposes Semble-compatible `search` and `find_related`
+  plus `graph_*` tools; the CLI mirrors Semble's commands and adds graph ones.
 - **Deterministic extraction.** Tree-sitter only. No network, LLM, or model
   calls during graph extraction.
 
@@ -38,7 +45,7 @@ Once the sidecar package is committed and pushed, it can also be installed
 directly from the git repository:
 
 ```bash
-pip install "semble-graph[mcp,search] @ git+https://github.com/dhanoopbhaskar/semble.git#subdirectory=packages/semble-graph"
+pipx install "semble-graph[mcp,search] @ git+https://github.com/dhanoopbhaskar/semble.git#subdirectory=packages/semble-graph"
 ```
 
 `pip install .` from the repository root installs Semble itself, not the
@@ -52,17 +59,26 @@ sidecar. Point at `packages/semble-graph` explicitly.
 Optional extras:
 
 ```bash
-pip install -e ".[search]"   # Semble-backed graph_search / combined MCP mode
+pip install -e ".[search]"   # Semble-backed search, find_related, graph_search
 pip install -e ".[mcp]"      # MCP server
 pip install -e ".[dev]"      # tests, ruff, mypy
 ```
 
-The sidecar works graph-only. `semble` is only needed for `graph_search` and
-`graph_search`-adjacent workflows.
+Graph tools work without Semble. `semble` is required for `search`,
+`find_related`, `graph_search`, and the Semble-compatible CLI commands
+(`file-types`, `savings`, `clear`, `install`, `uninstall`).
 
 ## Quick start
 
 ```bash
+# Semble-compatible commands
+semble-graph search "retry policy" ./repo
+semble-graph find-related src/payments/service.py 42 ./repo
+semble-graph file-types
+semble-graph savings
+semble-graph clear index
+
+# Graph commands
 semble-graph build ./repo
 semble-graph status ./repo
 semble-graph doctor
@@ -72,14 +88,33 @@ semble-graph neighbors src/payments/service.py:42 --repo ./repo --relation calle
 semble-graph impact src/payments/service.py --repo ./repo --depth 3
 semble-graph overview ./repo
 
-semble-graph search "retry policy" --repo ./repo --expand graph
+# Graph-augmented search (opt-in; the default matches Semble exactly)
+semble-graph search "retry policy" ./repo --expand graph
 ```
 
-Output is JSON by default for agents. Add `--format text` for humans.
+`search` and `find-related` accept multiple paths or git URLs, `-k/--top-k`,
+`--max-snippet-lines`, `--content`, and `--format`, just like Semble. Output is
+JSON by default for agents; add `--format text` for humans.
+
+Bare `semble-graph` (or `semble-graph --content ...`) starts the MCP server,
+matching `semble`'s dispatch.
 
 ## MCP configuration
 
-Run beside Semble (recommended):
+Run `semble-graph` on its own (it already exposes Semble's tools):
+
+```json
+{
+  "mcp": {
+    "semble-graph": {
+      "command": "semble-graph",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Or run it beside Semble if you want both processes:
 
 ```json
 {
@@ -96,23 +131,12 @@ Run beside Semble (recommended):
 }
 ```
 
-Combined mode (one MCP process, opt-in):
-
-```json
-{
-  "mcp": {
-    "semble-graph": {
-      "command": "semble-graph",
-      "args": ["mcp", "--include-search"]
-    }
-  }
-}
-```
-
-Default tools:
+Tools:
 
 | Tool | Purpose |
 |---|---|
+| `search` | Semble-compatible search (git URLs, multiple repos, `content`, snippets) |
+| `find_related` | Semble-compatible related-code lookup |
 | `graph_symbol` | Exact/qualified definitions plus direct callers, callees, importers |
 | `graph_neighbors` | Neighbouring symbols by relation, depth, confidence, evidence line |
 | `graph_impact` | Reverse-reachable dependants for changed paths or symbols |
@@ -120,8 +144,8 @@ Default tools:
 | `graph_path` | Shortest relation path between two symbols |
 | `graph_search` | Semble retrieval augmented with exact definitions and graph neighbours |
 
-`--include-search` additionally exposes `search` and `find_related`, backed by
-the Semble **library** (not by proxying Semble's MCP server).
+`search` and `find_related` are backed by the Semble **library** (not by
+proxying Semble's MCP server) and return Semble's exact result payloads.
 
 ## Supported languages
 
@@ -210,8 +234,9 @@ Semble-backed call. Outside the supported range it warns once, then runs
 optimistically. `semble-graph doctor` prints both versions and the verdict.
 
 Contract tests cover `semble.__all__`, `SembleIndex.from_path`, `Chunk` fields,
-`search`, `find_related`, and `index.chunks`. A test enforces that no module
-other than `compat.py` imports Semble.
+`search`, `find_related`, and `index.chunks`. Parity tests assert that Semble's
+MCP tool schemas and CLI commands/options are a subset of the sidecar's. A test
+enforces that no module other than `compat.py` imports Semble.
 
 ## Failure behavior
 
@@ -220,9 +245,10 @@ other than `compat.py` imports Semble.
 | Graph missing | Build on demand |
 | Graph corrupt | Rebuild |
 | Graph stale | Sync rebuild, or stale + background rebuild on large repos |
-| Semble missing | Graph tools still work; `graph_search` returns a clear error |
+| Semble missing | Graph tools still work; `search`, `find_related`, and Semble-backed CLI commands return a clear error |
 | Semble API mismatch | Warn once; adapter failures fail open at the tool boundary |
-| MCP tool error | Structured JSON error, never an uncaught exception |
+| MCP graph tool error | Structured JSON error, never an uncaught exception |
+| MCP `search` / `find_related` error | Semble-compatible text, matching Semble's MCP server |
 
 ## Development
 
@@ -243,5 +269,7 @@ PYTHONPATH=src python benchmarks/bench.py --repo ../.. --search
 
 ## Scope
 
-v1 targets local repository paths. Remote git URLs, communities beyond
-degree-based overview, and a Graphify-backed extractor are v1.1 / later work.
+Graph extraction targets local repository paths. `search`, `find-related`, and
+`graph_search` accept remote https/http git URLs and multiple repos through
+Semble. Communities beyond degree-based overview and a Graphify-backed extractor
+are later work.

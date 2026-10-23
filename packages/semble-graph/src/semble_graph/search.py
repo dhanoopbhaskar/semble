@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 _INDEX_LOCK = threading.Lock()
 _INDEX_CACHE: dict[str, Any] = {}
+_MERGED_LOCK = threading.Lock()
+_MERGED: tuple[list[Any], Any] | None = None
 _RELATIONSHIP = re.compile(
     r"\b(who\s+calls?|callers?|callees?|what\s+imports?|importers?|impact|blast(?:\s+radius)?|"
     r"depends?\s+on|tested\s+by|tests?|inherits?|implements?|subclasses?|neighbors?|neighbours?)\b",
@@ -57,13 +60,21 @@ class Candidate:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def _get_index(repo: str, content: tuple[str, ...] = ("code",)) -> Any:
-    key = f"{repo}:{','.join(content)}"
+def _normalize_source(source: str | Path) -> str:
+    """Return a stable cache key: resolved path for local dirs, URL untouched for git sources."""
+    raw = str(source)
+    return raw if compat.is_git_url(raw) else str(Path(raw).expanduser().resolve())
+
+
+def _get_index(source: str | Path, content: tuple[str, ...] = ("code",)) -> Any:
+    """Return a cached Semble index for one local path or git URL."""
+    raw = str(source)
+    key = f"{_normalize_source(raw)}:{','.join(content)}"
     with _INDEX_LOCK:
         cached = _INDEX_CACHE.get(key)
     if cached is not None:
         return cached
-    index = compat.build_index(repo, content)
+    index = compat.build_index(raw, content)
     with _INDEX_LOCK:
         if len(_INDEX_CACHE) >= 4:
             _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
@@ -71,15 +82,46 @@ def _get_index(repo: str, content: tuple[str, ...] = ("code",)) -> Any:
     return index
 
 
-def clear_index_cache() -> None:
-    """Drop the in-process Semble index cache (used by tests)."""
-    with _INDEX_LOCK:
-        _INDEX_CACHE.clear()
+def _validate_sources(repos: Sequence[str]) -> list[str]:
+    """Deduplicate sources and reject unsafe git transports, mirroring Semble."""
+    sources = list(dict.fromkeys(str(repo) for repo in repos))
+    if not sources:
+        raise ValueError("`repo` must name at least one local path or git URL.")
+    for source in sources:
+        if compat.is_git_url(source) and not source.startswith(("https://", "http://")):
+            raise ValueError(
+                f"Only https://, http://, or local directory paths are accepted as `repo`. Got: {source!r}"
+            )
+    return sources
+
+
+def get_semble_indexes(repos: str | Sequence[str], content: tuple[str, ...] = ("code",)) -> Any:
+    """Return a cached Semble index for one or several repos (merged when needed)."""
+    sources = _validate_sources([repos] if isinstance(repos, (str, Path)) else repos)
+    parts = [(source, _get_index(source, content)) for source in sources]
+    if len(parts) == 1:
+        return parts[0][1]
+
+    global _MERGED
+    indexes = [index for _, index in parts]
+    with _MERGED_LOCK:
+        if _MERGED is None or _MERGED[0] != indexes:
+            _MERGED = (indexes, compat.merge_indexes(parts))
+        return _MERGED[1]
 
 
 def get_semble_index(repo: str | Path, content: tuple[str, ...] = ("code",)) -> Any:
     """Return a cached Semble index for a repository."""
-    return _get_index(str(Path(repo).expanduser().resolve()), content)
+    return _get_index(repo, content)
+
+
+def clear_index_cache() -> None:
+    """Drop the in-process Semble index cache (used by tests)."""
+    global _MERGED
+    with _INDEX_LOCK:
+        _INDEX_CACHE.clear()
+    with _MERGED_LOCK:
+        _MERGED = None
 
 
 def _map_chunk(graph: Graph, chunk: Any) -> Symbol | None:
@@ -400,23 +442,58 @@ def _augment(
     }
 
 
+def run_search(
+    repos: str | Sequence[str],
+    query: str,
+    top_k: int = 5,
+    max_snippet_lines: int | None = None,
+    content: tuple[str, ...] = ("code",),
+) -> dict[str, Any]:
+    """Search one or more repos and return Semble's exact result payload.
+
+    Raises when Semble is unavailable or the index cannot be built. Tool and CLI
+    adapters turn that into Semble-compatible error text.
+    """
+    if not compat.semble_available():
+        raise RuntimeError("Semble is not installed; install the `search` extra")
+    index = get_semble_indexes(repos, content)
+    results = compat.search(index, query, top_k, max_snippet_lines)
+    if not results:
+        return {"error": "No results found."}
+    return compat.format_results(query, results, max_snippet_lines, index.sources)
+
+
+def run_find_related(
+    repos: str | Sequence[str],
+    file_path: str,
+    line: int,
+    top_k: int = 5,
+    max_snippet_lines: int | None = None,
+    content: tuple[str, ...] = ("code",),
+) -> dict[str, Any] | None:
+    """Return Semble's exact ``find_related`` payload, or ``None`` when no chunk covers the line."""
+    if not compat.semble_available():
+        raise RuntimeError("Semble is not installed; install the `search` extra")
+    index = get_semble_indexes(repos, content)
+    if compat.resolve_chunk(index.chunks, file_path, line) is None:
+        return None
+    results = compat.find_related(index, file_path, line, top_k, max_snippet_lines)
+    label = f"Chunks related to {file_path}:{line}"
+    if not results:
+        return {"error": f"No related chunks found for {file_path}:{line}."}
+    return compat.format_results(label, results, max_snippet_lines, index.sources)
+
+
 def plain_search(
     repo: str | Path,
     query: str,
-    top_k: int = 10,
+    top_k: int = 5,
+    max_snippet_lines: int | None = None,
     content: tuple[str, ...] = ("code",),
 ) -> dict[str, Any]:
-    """Return plain Semble results (used by combined MCP mode as a fallback)."""
-    if not compat.semble_available():
-        return {
-            "query": query,
-            "graph_status": "unavailable",
-            "error": compat.fallback_message("Semble is not installed"),
-        }
-    repo_path = Path(repo).expanduser().resolve()
+    """Fail-open wrapper around :func:`run_search` (kept for callers that must not raise)."""
     try:
-        index = _get_index(str(repo_path), content)
-        results = compat.search(index, query, top_k)
+        return run_search(repo, query, top_k=top_k, max_snippet_lines=max_snippet_lines, content=content)
     except Exception as exc:
         logger.exception("Plain Semble search failed")
         return {
@@ -425,4 +502,3 @@ def plain_search(
             "error": compat.fallback_message(str(exc)),
             "results": [],
         }
-    return {"query": query, "graph_status": "unavailable", "results": _plain_results(results, repo_path)}
