@@ -35,6 +35,21 @@ def test_exactness_and_test_bonuses(sample_repo: Path, settings: Settings) -> No
     assert rank_test_bonus(test_symbol, wants_tests=True) > rank_test_bonus(test_symbol, wants_tests=False)
 
 
+def test_map_chunk_prefers_innermost_symbol(sample_repo: Path, settings: Settings) -> None:
+    from semble_graph.search import _map_chunk
+
+    graph = build_graph(sample_repo, settings).graph
+    chunk = FakeChunk(
+        content="return self.gateway.authorize(payment)",
+        file_path="src/payments/service.py",
+        start_line=12,
+        end_line=12,
+    )
+    mapped = _map_chunk(graph, chunk)
+    assert mapped is not None
+    assert mapped.name == "charge"
+
+
 def test_seed_expansion(sample_repo: Path, settings: Settings) -> None:
     graph = build_graph(sample_repo, settings).graph
     charge = resolve_symbols(graph, "PaymentService.charge")[0]
@@ -42,6 +57,7 @@ def test_seed_expansion(sample_repo: Path, settings: Settings) -> None:
     assert expansion
     assert all(proximity_bonus(item) > 0 for item in expansion.values())
     assert max(item.distance for item in expansion.values()) <= 2
+    assert all(item.line is not None for item in expansion.values())
 
 
 @dataclass

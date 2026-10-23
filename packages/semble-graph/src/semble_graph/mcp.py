@@ -3,7 +3,10 @@
 import asyncio
 import json
 import logging
+import os
+import threading
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from semble_graph import compat
@@ -60,6 +63,14 @@ def _load(repo: str) -> tuple[Any, str]:
     return loaded.graph, loaded.status
 
 
+def _prewarm(repo: Path) -> None:
+    """Load (or build) the graph for a repository in a background thread."""
+    try:
+        get_service(repo, get_settings()).load()
+    except Exception:
+        logger.exception("Background graph prewarm failed for %s", repo)
+
+
 def _resolve_content_selection(content: _GRAPH_CONTENT | None, default_content: Sequence[str]) -> tuple[str, ...]:
     """Resolve an MCP content selection to content names."""
     if content is None:
@@ -87,8 +98,8 @@ def create_server(default_content: Sequence[str] = ("code",)) -> Any:
             "Instant code search plus a deterministic code graph for local repositories and git URLs. "
             "Use `search` for text retrieval and `find_related` for similar code, then `graph_symbol` for "
             "exact definitions, `graph_neighbors` for callers/callees/importers, `graph_impact` for blast "
-            "radius, and `graph_overview` for repository orientation. Every edge includes a confidence "
-            "label and evidence line."
+            "radius, `graph_overview` for repository orientation, and `graph_status` to inspect cache "
+            "freshness. Every edge includes a confidence label and evidence line."
         ),
     )
 
@@ -100,13 +111,44 @@ def create_server(default_content: Sequence[str] = ("code",)) -> Any:
             str | None,
             Field(description="Optional symbol kind: file, module, function, method, class, type, constant."),
         ] = None,
-        include_relations: Annotated[bool, Field(description="Include direct callers, callees, and importers.")] = True,
+        include_relations: Annotated[
+            bool,
+            Field(description="Include callers, callees, implementers, and importers."),
+        ] = True,
+        depth: Annotated[
+            int,
+            Field(description="Transitive depth for implemented_by/inherited_by (1-8).", ge=1, le=8),
+        ] = 2,
+        max_snippet_lines: Annotated[
+            int | None,
+            Field(description="Optional source lines to include per match; 0 or None omits the snippet.", ge=0),
+        ] = None,
     ) -> str:
-        """Look up exact or qualified symbol definitions and their direct relations."""
+        """Look up exact or qualified symbol definitions and their relations."""
         try:
             graph, status = _load(repo)
-            value = run_graph_symbol(graph, name, kind=kind, include_relations=include_relations)
+            value = run_graph_symbol(
+                graph,
+                name,
+                kind=kind,
+                include_relations=include_relations,
+                depth=depth,
+                repo=repo,
+                max_snippet_lines=max_snippet_lines,
+            )
             value["graph_status"] = status
+            return _json(value)
+        except Exception as exc:
+            return _error(exc)
+
+    @server.tool()
+    def graph_status(repo: Annotated[str, Field(description=_GRAPH_REPO_DESCRIPTION)]) -> str:
+        """Report graph freshness, cache location, counts, and build metadata."""
+        from semble_graph.graph.build import graph_status as run_graph_status
+
+        try:
+            value = run_graph_status(repo, get_settings())
+            value["graph_status"] = value.get("status", "unknown")
             return _json(value)
         except Exception as exc:
             return _error(exc)
@@ -196,8 +238,13 @@ def create_server(default_content: Sequence[str] = ("code",)) -> Any:
         top_k: Annotated[int, Field(description="Number of results to return.", ge=1)] = 10,
         token_budget: Annotated[int | None, Field(description="Optional output token budget.")] = None,
         expand: Annotated[bool, Field(description="Expand top seeds by one graph hop.")] = True,
+        content: Annotated[
+            _GRAPH_CONTENT | None,
+            Field(description="Content to search. Defaults to the MCP server's configured content."),
+        ] = None,
     ) -> str:
         """Graph-aware search: Semble retrieval augmented with exact definitions and graph neighbours."""
+        selected = _resolve_content_selection(content, default_content)
         try:
             return _json(
                 run_graph_search(
@@ -207,6 +254,7 @@ def create_server(default_content: Sequence[str] = ("code",)) -> Any:
                     token_budget=token_budget,
                     expand=expand,
                     settings=get_settings(),
+                    content=selected,
                 )
             )
         except Exception as exc:
@@ -294,6 +342,13 @@ def create_server(default_content: Sequence[str] = ("code",)) -> Any:
 
 
 def serve(content: Sequence[str] = ("code",)) -> None:
-    """Run the MCP server over stdio."""
+    """Run the MCP server over stdio, prewarming the current directory's graph."""
     server = create_server(default_content=content)
+    if os.environ.get("SEMBLE_GRAPH_PREWARM", "1").strip().lower() not in {"0", "false", "no", "off"}:
+        threading.Thread(
+            target=_prewarm,
+            args=(Path.cwd(),),
+            name="semble-graph-prewarm",
+            daemon=True,
+        ).start()
     asyncio.run(server.run_stdio_async())

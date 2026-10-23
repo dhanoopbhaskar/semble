@@ -48,6 +48,8 @@ class Settings:
     default_top_k: int
     overview_top_n: int
     stale_background_threshold: int
+    revalidate_seconds: float
+    revalidate_factor: float
     test_path_markers: tuple[str, ...]
 
     @classmethod
@@ -62,7 +64,9 @@ class Settings:
             max_depth=_env_int("SEMBLE_GRAPH_MAX_DEPTH", 8),
             default_top_k=_env_int("SEMBLE_GRAPH_TOP_K", 10),
             overview_top_n=_env_int("SEMBLE_GRAPH_OVERVIEW_TOP_N", 15),
-            stale_background_threshold=_env_int("SEMBLE_GRAPH_STALE_BACKGROUND_FILES", 5_000),
+            stale_background_threshold=_env_int("SEMBLE_GRAPH_STALE_BACKGROUND_FILES", 500),
+            revalidate_seconds=_env_float("SEMBLE_GRAPH_REVALIDATE_SECONDS", 2.0),
+            revalidate_factor=_env_float("SEMBLE_GRAPH_REVALIDATE_FACTOR", 3.0),
             test_path_markers=("tests/", "test/", "__tests__/", "spec/"),
         )
 

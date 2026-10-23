@@ -287,6 +287,9 @@ def build_graph(
                 build_seconds=stats.seconds,
             )
             atomic_install(build_dir, layout.graph_dir)
+            # ``save_graph`` writes the fingerprint to disk; attach the persisted
+            # metadata so an in-process cache entry is not considered stale forever.
+            graph.meta = read_meta(layout) or {"fingerprint": fingerprint}
         except Exception:
             from semble_graph.cache import remove_build_dir
 

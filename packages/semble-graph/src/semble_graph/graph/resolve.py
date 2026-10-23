@@ -28,6 +28,9 @@ class _Resolver:
     _bindings: dict[str, dict[str, list[int]]] = field(default_factory=lambda: defaultdict(dict))
     _paths: list[str] = field(default_factory=list)
     _dirs: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    _suffix_index: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    _suffix_cache: dict[tuple[str, ...], list[str]] = field(default_factory=dict)
+    _dir_suffix_cache: dict[str, list[str]] = field(default_factory=dict)
     _edge_keys: set[tuple[int, int, str]] = field(default_factory=set)
     _out_adj: dict[int, list[Edge]] = field(default_factory=lambda: defaultdict(list))
     _parents: dict[int, int] = field(default_factory=dict)
@@ -37,6 +40,7 @@ class _Resolver:
         self._paths = sorted(facts.path for facts in self.facts)
         for path in self._paths:
             self._dirs[posixpath.dirname(path)].append(path)
+            self._suffix_index[posixpath.basename(path)].append(path)
         self._add_symbols()
         self._resolve_imports()
         self._resolve_inheritance()
@@ -147,15 +151,34 @@ class _Resolver:
         return list(dict.fromkeys(found))
 
     def _suffix_candidates(self, suffixes: list[str]) -> list[str]:
-        """Find existing files ending with any suffix, preferring shortest paths."""
-        matches: list[str] = []
-        for path in self._paths:
-            for suffix in suffixes:
-                suffix = suffix.lstrip("./")
+        """Find existing files ending with any suffix, preferring shortest paths.
+
+        Candidates are looked up through a basename index instead of scanning every
+        indexed path, and repeated imports (a common pattern) reuse the cached result.
+        """
+        normalized = tuple(suffix.lstrip("./") for suffix in suffixes if suffix)
+        cached = self._suffix_cache.get(normalized)
+        if cached is not None:
+            return cached
+        matches: dict[str, None] = {}
+        for suffix in normalized:
+            for path in self._suffix_index.get(posixpath.basename(suffix), ()):
                 if path == suffix or path.endswith("/" + suffix):
-                    matches.append(path)
-                    break
-        return sorted(dict.fromkeys(matches), key=lambda item: (item.count("/"), item))
+                    matches[path] = None
+        ordered = sorted(matches, key=lambda item: (item.count("/"), item))
+        self._suffix_cache[normalized] = ordered
+        return ordered
+
+    def _suffix_dirs(self, suffix: str) -> list[str]:
+        """Return directories ending with ``suffix``, preferring shortest paths."""
+        cached = self._dir_suffix_cache.get(suffix)
+        if cached is None:
+            cached = sorted(
+                (directory for directory in self._dirs if directory == suffix or directory.endswith("/" + suffix)),
+                key=lambda item: (item.count("/"), item),
+            )
+            self._dir_suffix_cache[suffix] = cached
+        return cached
 
     def _python_targets(self, facts: FileFacts, imp: RawImport) -> list[str]:
         module = imp.module.replace(".", "/")
@@ -196,10 +219,7 @@ class _Resolver:
             return []
         for count in range(len(parts), 0, -1):
             suffix = "/".join(parts[-count:])
-            dirs = sorted(
-                (directory for directory in self._dirs if directory == suffix or directory.endswith("/" + suffix)),
-                key=lambda item: (item.count("/"), item),
-            )
+            dirs = self._suffix_dirs(suffix)
             if dirs:
                 return sorted(self._dirs[dirs[0]])
         return []

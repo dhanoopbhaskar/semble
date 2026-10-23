@@ -69,6 +69,13 @@ def test_rust_symbols_imports_and_calls() -> None:
     assert any(item.expression == "util::helper" for item in facts.calls)
 
 
+def test_java_interface_extends_heritage(tmp_path: Path) -> None:
+    source = b"package com.x;\npublic interface SubGateway extends Gateway, Other { }\n"
+    facts = extract_path(Path("com/x/SubGateway.java"), source, "java")
+    relations = {(item.relation, item.base) for item in facts.inherits}
+    assert relations == {("inherits", "Gateway"), ("inherits", "Other")}
+
+
 def test_java_symbols_imports_calls_and_heritage() -> None:
     facts = _parse("java/com/example/Service.java", "java")
     names = {symbol.qualified_name for symbol in facts.symbols}

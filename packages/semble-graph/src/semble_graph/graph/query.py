@@ -54,7 +54,7 @@ _CACHE_LOCK = threading.Lock()
 _GRAPH_CACHE: dict[str, tuple[float, Graph]] = {}
 _SERVICE_CACHE: dict[str, "GraphService"] = {}
 _REBUILDING: set[str] = set()
-_REVALIDATE_SECONDS = 2.0
+_MAX_RELATION_DEPTH = 8
 
 
 @dataclass(slots=True)
@@ -111,6 +111,17 @@ class GraphService:
         self.key = self.layout.key_dir.name
         self._last_check = 0.0
         self._status = "fresh"
+        self._graph: Graph | None = None
+
+    def _cooldown_seconds(self, graph: Graph) -> float:
+        """Return the revalidation cooldown for a graph.
+
+        Mirrors Semble's adaptive policy: wait at least ``factor`` times the last
+        build's duration, with a small configured floor for very fast builds.
+        """
+        raw = graph.meta.get("build_seconds")
+        build_seconds = float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else 0.0
+        return max(self.settings.revalidate_seconds, max(0.0, build_seconds) * self.settings.revalidate_factor)
 
     def load(self, rebuild: bool = True, background: bool = True) -> LoadedGraph | None:
         """Return a graph, rebuilding synchronously when stale unless the repo is large."""
@@ -124,11 +135,19 @@ class GraphService:
                 logger.exception("Graph build failed for %s", self.repo)
                 return None
             self._remember(result.graph)
+            self._graph = result.graph
+            self._last_check = time.monotonic()
             self._status = "fresh"
             return LoadedGraph(result.graph, "fresh", self.key, str(self.layout.graph_dir))
 
+        if self._graph is not None and cached is not self._graph:
+            # A background rebuild replaced the cached graph; the new graph is fresh.
+            self._status = "fresh"
+            self._last_check = time.monotonic()
+        self._graph = cached
+
         now = time.monotonic()
-        if now - self._last_check < _REVALIDATE_SECONDS:
+        if now - self._last_check < self._cooldown_seconds(cached):
             return LoadedGraph(cached, self._status, self.key, str(self.layout.graph_dir))
 
         self._last_check = now
@@ -160,6 +179,8 @@ class GraphService:
             self._status = "stale"
             return LoadedGraph(cached, "stale", self.key, str(self.layout.graph_dir))
         self._remember(result.graph)
+        self._graph = result.graph
+        self._last_check = time.monotonic()
         self._status = "fresh"
         return LoadedGraph(result.graph, "rebuilt", self.key, str(self.layout.graph_dir))
 
@@ -272,6 +293,23 @@ def symbol_payload(symbol: Symbol) -> dict[str, Any]:
     return payload
 
 
+def _symbol_snippet(repo: str | Path | None, symbol: Symbol, max_lines: int) -> str | None:
+    """Read a bounded source snippet scoped to a symbol's own span."""
+    if repo is None or max_lines <= 0:
+        return None
+    path = Path(repo).expanduser()
+    try:
+        with (path / symbol.file_path).open("r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+    start = max(1, symbol.start_line)
+    end = min(len(lines), symbol.end_line, start + max_lines - 1)
+    if end < start:
+        return None
+    return "".join(lines[start - 1 : end]).rstrip()
+
+
 def _edge_payload(graph: Graph, edge: Edge, direction: str, depth: int | None = None) -> dict[str, Any]:
     other_id = edge.src if direction == "in" else edge.dst
     other = graph.symbol(other_id)
@@ -288,16 +326,81 @@ def _edge_payload(graph: Graph, edge: Edge, direction: str, depth: int | None = 
     return payload
 
 
-def _relations(graph: Graph, symbol: Symbol) -> dict[str, list[dict[str, Any]]]:
-    """Return direct relations for a symbol, grouped by role."""
+def _closure_payload(graph: Graph, edge: Edge, relation: str, depth: int, direct: bool) -> dict[str, Any]:
+    """Serialize one edge in a transitive relation closure."""
+    payload = _edge_payload(graph, edge, "in", depth)
+    payload["relation"] = relation
+    payload["direct"] = direct
+    return payload
+
+
+def _implementations(graph: Graph, symbol: Symbol, depth: int) -> list[dict[str, Any]]:
+    """Return direct and indirect implementers of ``symbol``.
+
+    Direct implementers are reached through incoming ``implements`` edges. Their
+    subclasses (for example a concrete class extending an abstract implementation)
+    are reported as indirect implementers. Interfaces that extend ``symbol`` are
+    traversed so implementations of a sub-interface are still discovered.
+    """
+    items: list[dict[str, Any]] = []
+    seen = {symbol.id}
+    frontier: deque[tuple[int, int]] = deque([(symbol.id, 0)])
+    walk_interface_hierarchy = symbol.kind is SymbolKind.TYPE
+    while frontier:
+        current, current_depth = frontier.popleft()
+        if current_depth >= depth:
+            continue
+        for edge in graph.in_edges(current, {"implements", "inherits"}):
+            if edge.src in seen:
+                continue
+            direct = current_depth == 0 and edge.kind == "implements"
+            if current_depth == 0 and edge.kind == "inherits":
+                # An outgoing ``inherits`` edge from an interface points at a
+                # sub-interface: traverse it but do not count it as an implementation.
+                if not walk_interface_hierarchy:
+                    continue
+                seen.add(edge.src)
+                frontier.append((edge.src, current_depth + 1))
+                continue
+            seen.add(edge.src)
+            items.append(_closure_payload(graph, edge, "implemented_by", current_depth + 1, direct))
+            frontier.append((edge.src, current_depth + 1))
+    return items
+
+
+def _subclasses(graph: Graph, symbol: Symbol, depth: int) -> list[dict[str, Any]]:
+    """Return direct and indirect subclasses of ``symbol``."""
+    items: list[dict[str, Any]] = []
+    seen = {symbol.id}
+    frontier: deque[tuple[int, int]] = deque([(symbol.id, 0)])
+    while frontier:
+        current, current_depth = frontier.popleft()
+        if current_depth >= depth:
+            continue
+        for edge in graph.in_edges(current, {"inherits"}):
+            if edge.src in seen:
+                continue
+            seen.add(edge.src)
+            items.append(_closure_payload(graph, edge, "inherited_by", current_depth + 1, current_depth == 0))
+            frontier.append((edge.src, current_depth + 1))
+    return items
+
+
+def _relations(graph: Graph, symbol: Symbol, depth: int = 2) -> dict[str, list[dict[str, Any]]]:
+    """Return relations for a symbol, grouped by role.
+
+    ``implemented_by`` and ``inherited_by`` include transitive results up to
+    ``depth`` and tag each entry with ``direct`` and ``depth``.
+    """
+    depth = max(1, min(depth, _MAX_RELATION_DEPTH))
     callers = [_edge_payload(graph, edge, "in") for edge in graph.in_edges(symbol.id, {"calls"})]
     callees = [_edge_payload(graph, edge, "out") for edge in graph.out_edges(symbol.id, {"calls"})]
     importers = [_edge_payload(graph, edge, "in") for edge in graph.in_edges(symbol.id, {"imports", "imports_from"})]
     imports = [_edge_payload(graph, edge, "out") for edge in graph.out_edges(symbol.id, {"imports", "imports_from"})]
     inherits = [_edge_payload(graph, edge, "out") for edge in graph.out_edges(symbol.id, {"inherits"})]
-    inherited_by = [_edge_payload(graph, edge, "in") for edge in graph.in_edges(symbol.id, {"inherits"})]
+    inherited_by = _subclasses(graph, symbol, depth)
     implements = [_edge_payload(graph, edge, "out") for edge in graph.out_edges(symbol.id, {"implements"})]
-    implemented_by = [_edge_payload(graph, edge, "in") for edge in graph.in_edges(symbol.id, {"implements"})]
+    implemented_by = _implementations(graph, symbol, depth)
     tested_by = [_edge_payload(graph, edge, "in") for edge in graph.in_edges(symbol.id, {"tests"})]
     tests = [_edge_payload(graph, edge, "out") for edge in graph.out_edges(symbol.id, {"tests"})]
     return {
@@ -318,6 +421,7 @@ def _sort_relations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         items,
         key=lambda item: (
+            item.get("depth", 0),
             (item.get("symbol") or {}).get("file_path", ""),
             (item.get("symbol") or {}).get("start_line", 0),
             item["relation"],
@@ -325,14 +429,26 @@ def _sort_relations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-def graph_symbol(graph: Graph, name: str, kind: str | None = None, include_relations: bool = True) -> dict[str, Any]:
-    """Exact/qualified symbol lookup."""
+def graph_symbol(
+    graph: Graph,
+    name: str,
+    kind: str | None = None,
+    include_relations: bool = True,
+    depth: int = 2,
+    repo: str | Path | None = None,
+    max_snippet_lines: int | None = None,
+) -> dict[str, Any]:
+    """Exact/qualified symbol lookup with optional transitive relations and snippet."""
     matches = resolve_symbols(graph, name, kind)
     payloads: list[dict[str, Any]] = []
     for symbol in matches:
         payload = symbol_payload(symbol)
         if include_relations:
-            payload["relations"] = _relations(graph, symbol)
+            payload["relations"] = _relations(graph, symbol, depth)
+        if max_snippet_lines is not None:
+            snippet = _symbol_snippet(repo, symbol, max_snippet_lines)
+            if snippet:
+                payload["snippet"] = snippet
         payloads.append(payload)
     return {"query": name, "count": len(payloads), "matches": payloads}
 

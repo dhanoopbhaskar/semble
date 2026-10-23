@@ -33,46 +33,47 @@ def is_git_repo(repo: Path) -> bool:
     return result is not None and result.strip() == "true"
 
 
+def _file_entries(walk: WalkResult | None) -> list[tuple[str, int, int]]:
+    """Return sorted ``(path, mtime_ns, size)`` tuples for the indexed file set."""
+    entries: list[tuple[str, int, int]] = []
+    if walk is None:
+        return entries
+    for file in walk.files:
+        try:
+            stat = file.absolute_path.stat()
+            entries.append((file.path, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            entries.append((file.path, 0, 0))
+    entries.sort()
+    return entries
+
+
 def repo_fingerprint(repo: str | Path, walk: WalkResult | None = None) -> dict[str, object]:
     """Compute a deterministic fingerprint for a repository.
 
-    Git repositories use ``HEAD``, ``git status --porcelain``, tracked file count
-    and the maximum observed mtime. Non-git repositories hash the sorted
-    ``(path, mtime_ns, size)`` tuples.
+    The fingerprint covers only the files the graph actually indexes: their
+    repo-relative paths, modification times, and sizes. Untracked artifacts such
+    as ``.DS_Store`` and editor caches therefore never invalidate the graph.
+
+    Git repositories additionally include ``HEAD`` as a cheap branch/commit
+    signal. The previous implementation hashed ``git status --porcelain`` for the
+    whole work tree, which made every untracked file trigger a full rebuild.
     """
     root = Path(repo).expanduser().resolve()
-    max_mtime = 0
-    if walk is not None:
-        for file in walk.files:
-            try:
-                max_mtime = max(max_mtime, file.absolute_path.stat().st_mtime_ns)
-            except OSError:
-                continue
+    entries = _file_entries(walk)
+    encoded = json.dumps(entries, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
 
     if is_git_repo(root):
         head = (_git(root, "rev-parse", "HEAD") or "").strip()
-        status = _git(root, "status", "--porcelain") or ""
-        tracked = _git(root, "ls-files", "-z") or ""
-        tracked_count = len([item for item in tracked.split("\0") if item])
-        status_digest = hashlib.sha256(status.encode("utf-8")).hexdigest()
         return {
             "kind": "git",
             "head": head,
-            "status_digest": status_digest,
-            "tracked_count": tracked_count,
-            "max_mtime_ns": max_mtime,
+            "files_digest": digest,
+            "files_count": len(entries),
         }
 
-    entries: list[tuple[str, int, int]] = []
-    if walk is not None:
-        for file in walk.files:
-            try:
-                stat = file.absolute_path.stat()
-                entries.append((file.path, stat.st_mtime_ns, stat.st_size))
-            except OSError:
-                entries.append((file.path, 0, 0))
-    encoded = json.dumps(sorted(entries), separators=(",", ":")).encode("utf-8")
-    return {"kind": "files", "digest": hashlib.sha256(encoded).hexdigest(), "count": len(entries)}
+    return {"kind": "files", "digest": digest, "count": len(entries)}
 
 
 def fingerprint_digest(fingerprint: dict[str, object]) -> str:
