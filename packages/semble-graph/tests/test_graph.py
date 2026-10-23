@@ -104,6 +104,43 @@ def test_overview(sample_repo: Path, settings: Settings) -> None:
     assert overview["entry_points"]
 
 
+def test_transitive_implementations_are_tagged() -> None:
+    from semble_graph.graph.model import Confidence, Edge, Graph, Symbol
+
+    symbols = [
+        Symbol(0, "Gateway", "Gateway", SymbolKind.TYPE, "java/Gateway.java", 1, 4),
+        Symbol(1, "AbstractGateway", "AbstractGateway", SymbolKind.CLASS, "java/AbstractGateway.java", 1, 4),
+        Symbol(2, "PassthroughGateway", "PassthroughGateway", SymbolKind.CLASS, "java/Passthrough.java", 1, 4),
+        Symbol(3, "NullGateway", "NullGateway", SymbolKind.CLASS, "java/NullGateway.java", 1, 4),
+    ]
+    edges = [
+        Edge(1, 0, "implements", Confidence.EXTRACTED.value, 3),
+        Edge(2, 1, "inherits", Confidence.EXTRACTED.value, 3),
+        Edge(3, 1, "inherits", Confidence.EXTRACTED.value, 3),
+    ]
+    graph = Graph(symbols=symbols, edges=edges)
+
+    relations = graph_symbol(graph, "Gateway")["matches"][0]["relations"]
+    implemented = {item["symbol"]["name"]: item for item in relations["implemented_by"]}
+    assert set(implemented) == {"AbstractGateway", "PassthroughGateway", "NullGateway"}
+    assert implemented["AbstractGateway"]["direct"] is True
+    assert implemented["AbstractGateway"]["depth"] == 1
+    assert implemented["PassthroughGateway"]["direct"] is False
+    assert implemented["PassthroughGateway"]["depth"] == 2
+
+    shallow = graph_symbol(graph, "Gateway", depth=1)["matches"][0]["relations"]
+    assert {item["symbol"]["name"] for item in shallow["implemented_by"]} == {"AbstractGateway"}
+
+
+def test_graph_symbol_can_include_scoped_snippet(sample_repo: Path, settings: Settings) -> None:
+    graph = build_graph(sample_repo, settings).graph
+    payload = graph_symbol(graph, "PaymentService", repo=sample_repo, max_snippet_lines=2)
+    match = payload["matches"][0]
+    assert match["start_line"] == 5
+    assert match["snippet"].startswith("class PaymentService")
+    assert len(match["snippet"].splitlines()) <= 2
+
+
 def test_incremental_build_reuses_unchanged_files(sample_repo: Path, settings: Settings) -> None:
     first = build_graph(sample_repo, settings)
     second = build_graph(sample_repo, settings)

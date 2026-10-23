@@ -47,18 +47,35 @@ def _parse_imports(facts: FileFacts, node: Node, source: bytes) -> None:
         facts.imports.append(RawImport(module=body, line=line_of(node), names=[(last, last)], is_from=True))
 
 
-def _parse_heritage(facts: FileFacts, node: Node, source: bytes, qualified: str) -> None:
-    """Extract superclass and interface clauses."""
+def _heritage_nodes(node: Node) -> list[Node]:
+    """Return superclass/interface clauses.
+
+    ``extends_interfaces`` is a named child in the Java grammar rather than a
+    field, so it needs to be collected separately from the field lookups.
+    """
+    found: list[Node] = []
+    seen: set[int] = set()
     for field in _HERITAGE_FIELDS:
         heritage = node.child_by_field_name(field)
-        if heritage is None:
-            continue
+        if heritage is not None and heritage.id not in seen:
+            seen.add(heritage.id)
+            found.append(heritage)
+    for child in node.named_children:
+        if child.type in {"super_interfaces", "extends_interfaces"} and child.id not in seen:
+            seen.add(child.id)
+            found.append(child)
+    return found
+
+
+def _parse_heritage(facts: FileFacts, node: Node, source: bytes, qualified: str) -> None:
+    """Extract superclass and interface clauses."""
+    for heritage in _heritage_nodes(node):
+        relation = "inherits" if heritage.type in {"superclass", "extends_interfaces"} else "implements"
         for child in heritage.named_children:
             if child.type in {"type_identifier", "scoped_type_identifier", "generic_type"}:
                 base_full = text(child, source).strip()
                 base = clean_type_name(base_full)
                 if base:
-                    relation = "inherits" if field == "superclass" else "implements"
                     facts.inherits.append(
                         RawInherit(
                             owner=qualified,
@@ -78,7 +95,7 @@ def _parse_heritage(facts: FileFacts, node: Node, source: bytes, qualified: str)
                                 owner=qualified,
                                 base=base,
                                 base_full=base_full,
-                                relation="implements",
+                                relation=relation,
                                 line=line_of(item),
                             )
                         )

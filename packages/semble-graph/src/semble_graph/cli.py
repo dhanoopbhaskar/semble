@@ -159,7 +159,9 @@ def _print_results(out: dict[str, Any], output_format: str) -> None:
 
 
 def _load(repo: str, settings: Settings, *, rebuild: bool = True) -> LoadedGraph:
-    loaded = get_service(repo, settings).load(rebuild=rebuild)
+    # A CLI process is short-lived, so a background rebuild would be killed on
+    # exit; wait for a synchronous rebuild instead of returning a stale graph.
+    loaded = get_service(repo, settings).load(rebuild=rebuild, background=False)
     if loaded is None:
         raise SystemExit(f"Could not load or build a graph for {repo!r}.")
     return loaded
@@ -196,6 +198,7 @@ def _run_search(args: argparse.Namespace, settings: Settings) -> int:
             expand=True,
             settings=settings,
             content=content,
+            background=False,
         )
         _emit(value, args.format, "search")
         return 0
@@ -329,7 +332,15 @@ def _run(args: argparse.Namespace) -> int:
     graph = loaded.graph
 
     if args.command == "symbol":
-        value = graph_symbol(graph, args.name, kind=args.kind, include_relations=not args.no_relations)
+        value = graph_symbol(
+            graph,
+            args.name,
+            kind=args.kind,
+            include_relations=not args.no_relations,
+            depth=args.depth,
+            repo=args.repo,
+            max_snippet_lines=args.max_snippet_lines,
+        )
         value["graph_status"] = loaded.status
         _emit(value, args.format, "symbol")
         return 0
@@ -412,7 +423,15 @@ def build_parser() -> argparse.ArgumentParser:
     symbol = subparsers.add_parser("symbol", help="Look up an exact or qualified symbol.")
     symbol.add_argument("name")
     symbol.add_argument("--kind", choices=[kind.value for kind in SymbolKind])
-    symbol.add_argument("--no-relations", action="store_true", help="Omit direct relations.")
+    symbol.add_argument("--no-relations", action="store_true", help="Omit relations.")
+    symbol.add_argument("--depth", type=int, default=2, help="Transitive depth for implemented_by/inherited_by.")
+    symbol.add_argument(
+        "--max-snippet-lines",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Include up to N source lines for each match (omitted by default).",
+    )
     _add_common(symbol)
 
     neighbors = subparsers.add_parser("neighbors", help="Find neighbouring symbols.")

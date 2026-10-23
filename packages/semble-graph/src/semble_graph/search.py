@@ -138,6 +138,9 @@ def _map_chunk(graph: Graph, chunk: Any) -> Symbol | None:
         if overlap > best_overlap:
             best = symbol
             best_overlap = overlap
+        elif overlap == best_overlap and best is not None:
+            if (symbol.end_line - symbol.start_line) < (best.end_line - best.start_line):
+                best = symbol
     return best or graph.file_symbol(file_path)
 
 
@@ -315,6 +318,7 @@ def graph_search(
     expand: bool = True,
     settings: Settings | None = None,
     content: tuple[str, ...] = ("code",),
+    background: bool = True,
 ) -> dict[str, Any]:
     """Run Semble retrieval and augment it with graph context.
 
@@ -323,7 +327,7 @@ def graph_search(
     """
     repo_path = Path(repo).expanduser().resolve()
     settings = settings or Settings.from_env()
-    loaded = get_service(repo_path, settings).load()
+    loaded = get_service(repo_path, settings).load(background=background)
     graph = loaded.graph if loaded is not None else None
     graph_status = loaded.status if loaded is not None else "unavailable"
 
@@ -421,6 +425,7 @@ def _augment(
                 via="expansion",
                 relation=expansion.relation,
                 confidence=expansion.confidence,
+                evidence_line=expansion.line,
             )
         )
 

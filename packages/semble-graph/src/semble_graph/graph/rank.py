@@ -28,6 +28,7 @@ class Expansion:
     via: int
     relation: str
     confidence: str
+    line: int | None = None
 
 
 def normalize_scores(scores: list[float]) -> list[float]:
@@ -60,6 +61,7 @@ def expand_seeds(graph: Graph, seeds: list[Seed], max_distance: int = 1) -> dict
                 via=origin,
                 relation=edge.kind,
                 confidence=edge.confidence,
+                line=edge.line,
             )
             frontier.append((edge.dst, distance + 1, origin, edge.kind))
     return expansions

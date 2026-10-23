@@ -23,6 +23,40 @@ def test_mcp_tool_names_expose_semble_surface() -> None:
     assert {"search", "find_related"} <= set(names)
 
 
+def test_mcp_graph_search_and_symbol_schema() -> None:
+    pytest.importorskip("mcp")
+    from semble_graph.mcp import create_server
+
+    server = create_server()
+
+    async def _schema() -> dict[str, set[str]]:
+        tools = await server.list_tools()
+        return {tool.name: set((tool.input_schema or {}).get("properties", {})) for tool in tools}
+
+    schema = asyncio.run(_schema())
+    assert {"content", "expand"} <= schema["graph_search"]
+    assert {"depth", "max_snippet_lines"} <= schema["graph_symbol"]
+    assert "graph_status" in schema
+
+
+def test_mcp_graph_status_call(sample_repo, tmp_path, monkeypatch) -> None:
+    pytest.importorskip("mcp")
+    import json
+
+    from semble_graph.mcp import create_server
+
+    monkeypatch.setenv("SEMBLE_GRAPH_CACHE_DIR", str(tmp_path / "cache"))
+    server = create_server()
+
+    async def _call() -> object:
+        return await server.call_tool("graph_status", {"repo": str(sample_repo)})
+
+    result = asyncio.run(_call())
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "missing"
+    assert payload["graph_status"] == "missing"
+
+
 def test_mcp_graph_symbol_call(sample_repo, tmp_path, monkeypatch) -> None:
     pytest.importorskip("mcp")
     import json

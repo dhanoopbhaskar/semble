@@ -137,12 +137,13 @@ Tools:
 |---|---|
 | `search` | Semble-compatible search (git URLs, multiple repos, `content`, snippets) |
 | `find_related` | Semble-compatible related-code lookup |
-| `graph_symbol` | Exact/qualified definitions plus direct callers, callees, importers |
+| `graph_symbol` | Exact/qualified definitions plus transitive callers, callees, implementers, importers |
 | `graph_neighbors` | Neighbouring symbols by relation, depth, confidence, evidence line |
 | `graph_impact` | Reverse-reachable dependants for changed paths or symbols |
 | `graph_overview` | Counts, core symbols by degree, likely entry points |
 | `graph_path` | Shortest relation path between two symbols |
 | `graph_search` | Semble retrieval augmented with exact definitions and graph neighbours |
+| `graph_status` | Graph freshness, cache path, counts, and build metadata |
 
 `search` and `find_related` are backed by the Semble **library** (not by
 proxying Semble's MCP server) and return Semble's exact result payloads.
@@ -216,11 +217,24 @@ definition. If graph augmentation fails, plain Semble results are returned with
 - `SEMBLE_GRAPH_CACHE_DIR` overrides the cache root.
 - `SEMBLE_MAX_FILE_BYTES` caps indexed file size (default `1_000_000`).
 - Incremental builds reuse raw facts by `(mtime_ns, size)`.
-- Global resolution runs on every build.
+- Global resolution runs on every build. Import resolution uses a basename suffix
+  index and memoizes repeated modules, so a large build is proportional to the
+  number of imports rather than imports × files.
+- The freshness fingerprint covers only indexed files (path, mtime, size) plus
+  `HEAD` for git repositories. Untracked artifacts such as `.DS_Store` do not
+  invalidate the graph.
 - Builds write to a temporary directory and atomically swap the current graph.
-- Small repositories rebuild synchronously when stale. Large repositories
-  (`SEMBLE_GRAPH_STALE_BACKGROUND_FILES`, default `5000`) serve the stale graph
-  with `"graph_status": "stale"` and rebuild in the background.
+- Small repositories rebuild synchronously when stale. Repositories with at
+  least `SEMBLE_GRAPH_STALE_BACKGROUND_FILES` files (default `500`) serve the
+  stale graph with `"graph_status": "stale"` and rebuild in the background.
+- Freshness revalidation is adaptive, following Semble's MCP cache policy: the
+  cooldown is `max(SEMBLE_GRAPH_REVALIDATE_SECONDS, factor × last build time)`
+  with `SEMBLE_GRAPH_REVALIDATE_FACTOR` defaulting to `3` and the floor
+  `SEMBLE_GRAPH_REVALIDATE_SECONDS` defaulting to `2`.
+- `implemented_by` and `inherited_by` include transitive results up to `depth`
+  (default `2`) and tag each entry with `direct` and `depth`.
+- The MCP server prewarms the current directory's graph in a background thread
+  at startup. Set `SEMBLE_GRAPH_PREWARM=0` to disable it.
 - The sidecar refuses a cache root inside `SEMBLE_CACHE_LOCATION`.
 
 ## Compatibility matrix

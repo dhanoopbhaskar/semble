@@ -39,3 +39,9 @@ repos:
         types: [python]
         pass_filenames: false
         args: [src/]
+      - id: pytest-semble-graph
+        name: pytest (semble-graph)
+        entry: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE uv run pytest -c packages/semble-graph/pyproject.toml packages/semble-graph/tests
+        language: system
+        pass_filenames: false
+        always_run: true
